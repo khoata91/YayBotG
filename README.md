@@ -10,7 +10,7 @@ YayBot watches the Slack support channels of **one plugin you choose** (e.g. Yay
    - 🧑‍💻 **You need to fix it** (`technical`, `major`, `fatal`, or Claude is unsure): the cause and a suggested fix. Claude does not fix it and does not answer the customer.
 5. It sends a short notification to your phone.
 
-YayBot writes nowhere else in Slack. Everything is done with one command, `yb <task>`, and there is no database. Config and temporary data live in `~/.yaybot`.
+YayBot writes nowhere else in Slack. Everything is done with one command, `yb <task>`, and there is no database. Config and temporary data live in `~/.yaybot`. With **`yb cloud`**, the ticket queue and Claude's conversations are also kept in a private git repo, so a second computer continues the tickets when the first one is switched off (see [Several computers](#several-computers-yb-cloud)).
 
 ---
 
@@ -181,7 +181,7 @@ Limits: at most **5** ticket sessions run at once (the rest start on the next ru
 - each ticket session: `T7 · YayCurrency · major · Anna · work-mac`;
 - every log line: `[2026-10-08 09:12:03] [work-mac] …`.
 
-The name defaults to the computer's host name. Change it with `yb device work`, then `yb stop all && yb start`. Note that two computers running YayBot on the same channels still both process the same tickets.
+The name defaults to the computer's host name. Change it with `yb device work`, then `yb stop all && yb start`. Without `yb cloud`, two computers running YayBot on the same channels both process the same tickets. With `yb cloud`, only one of them works at a time and the other one takes over (next section).
 
 **When the Mac is switched off or loses power:**
 
@@ -198,6 +198,30 @@ At the next login, macOS opens a Terminal window in the background that runs `yb
 5. fetches the tickets that arrived while the Mac was off.
 
 This only happens if YayBot was running when the Mac went off: after `yb stop`, it stays off. A session that you closed yourself (`yb close T7`, `yb cleanup`) is never resumed. If Claude stops in the middle of a ticket while the Mac is running, the ticket is resumed in the same way. To let the Mac switch itself back on after a power failure: `sudo pmset -a autorestart 1`. You still need to log in; with FileVault, macOS cannot log in by itself. Turn autostart off with `yb autostart off`; its log is `~/.yaybot/boot.log`.
+
+### Several computers: `yb cloud`
+
+To make a second computer continue the work when the main one is switched off in the middle of a ticket, the computers share the queue through a **private git repo** (for example on GitHub). You do not need a server or a database.
+
+1. Create an **empty, private** repo, e.g. `yaybot-state` (github.com/new). It stores the tickets' text and Claude's conversations, so keep it private.
+2. On **each** computer, set up YayBot as usual (`yb setup xoxb-…`, same token, plugin and channels), with a different `yb device` name, then:
+
+   ```bash
+   yb cloud git@github.com:<you>/yaybot-state.git   # the computer must be able to push to it (git/gh login)
+   yb start
+   yb autostart on                                   # macOS: come back after a restart
+   ```
+
+The first computer that runs `yb start` **works**. The others say *"Standby: work-mac works on the tickets"*. They keep watching but do nothing in Slack.
+
+- The working computer saves the queue (`state.json`), the results and the **conversations of the unfinished ticket sessions** to the repo after every run and every minute (its sign of life).
+- If the working computer stops sending signs of life for **5 minutes** (`CLOUD_LEASE`), for example because it was switched off, lost power or crashed, a standby computer **takes over**. It downloads the queue, continues each unfinished ticket with `claude --resume` (Claude keeps its previous analysis), and then fetches the new tickets. The ticket numbers continue (T8, T9…) and no ticket is processed twice.
+- `yb stop` on the working computer hands the work over **at once**. To stop everything, run `yb stop` on every computer.
+- When the first computer comes back, it waits on standby. It does not take the work back by itself.
+- Take over by hand right now, e.g. when you know the other computer is off: `yb takeover`.
+- `yb cloud` (or `yb status`) shows who works and the last sign of life. `yb cloud off` turns it off.
+
+Limits: up to about one minute of a conversation can be lost. A `trivial` fix that was not pushed yet is started again in a new worktree. If the working computer loses its network for more than 5 minutes while still running, both computers may work for a while. When it comes back online, it sees that the other computer took over and stops.
 
 **First time only:** run `yb attach`. If Claude asks *"Do you trust the files in this folder?"*, choose **Yes**, then press **Ctrl+B, then D** to leave it running. YayBot normally marks this folder as trusted for you.
 
@@ -267,6 +291,7 @@ Edit `~/.yaybot/config` (`open -e ~/.yaybot/config`), then run `yb stop all && y
 | `MAX_SESSIONS` · `SESSION_TIMEOUT` · `KEEP_SESSIONS_HOURS` | `5` · `7200` · `24` | sessions at once · seconds before giving up · hours before closing |
 | `KEEP_AWAKE` · `WATCH_EVERY` | `1` · `60` | keep the Mac awake · seconds between two checks of the main session |
 | `MAX_RESUMES` | `2` | how often an interrupted ticket session is resumed |
+| `CLOUD_REPO` · `CLOUD_BRANCH` · `CLOUD_LEASE` | set by `yb cloud` · `yaybot` · `300` | the private git repo shared by your computers · its branch · seconds without a sign of life before a standby computer takes over |
 
 ---
 
@@ -285,6 +310,8 @@ Edit `~/.yaybot/config` (`open -e ~/.yaybot/config`), then run `yb stop all && y
 | A ticket was missed | `yb plugin` to check its channel and keywords; add the channel with `yb channels`, use `:all`, or add a keyword (with `"edited": true`). Then `yb rescan 7` reads the channels again: messages that were skipped are checked again, and tickets already reported are not repeated |
 | No session on the phone | same claude.ai account on the Mac and phone; `claude update`; `yb attach` to see errors |
 | A ticket session stays "working" | `tmux attach -t yb-T7` to see what it is doing (Ctrl+B, D to leave) |
+| `Cloud: … not reachable` | the computer cannot push to the repo: try `git ls-remote <url>`; log in to GitHub (ssh key or `gh auth login`) |
+| The second computer does not take over | `yb status` on it must say *Standby* and *Watchdog ✓ on*; it takes over 5 min after the last sign of life (`yb takeover` = now) |
 | YayBot did not come back after a restart | `yb status` shows *Autostart* and the last boot; read `~/.yaybot/boot.log`. Turn it on with `yb autostart on`. You can run `yb boot` by hand at any time |
 | The main session keeps stopping | `yb status` shows *claude stopped* with the reason; `yb log` shows the watchdog restarts. Run `yb doctor`, fix the cause (often `claude update` or a logged-out Claude Code), then `yb start` |
 | The main session does not run every 10 minutes | `claude update` (needs `/loop`), or type in the session: "run yb run every 10 minutes" |
@@ -306,6 +333,8 @@ yb scan [7|2026-10-01]         list the plugin's tickets, changes nothing
 yb start | stop [all] | attach start (+ watchdog, Mac kept awake) / stop (all = also ticket sessions) / view the main session
 yb device [name]               show / set this computer's name
 yb autostart [on|off]          start again by itself after the Mac restarts (resumes unfinished tickets)
+yb cloud [git-url|off]         share the work between computers (private git repo): one works, the others take over
+yb takeover                    this computer takes the work over now (cloud)
 yb boot                        what autostart runs (you can also run it by hand)
 yb try [days]                  process the newest ticket now
 yb run | collect               process once now / pick up finished ticket sessions now

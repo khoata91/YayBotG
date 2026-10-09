@@ -25,6 +25,9 @@
 #  yb autostart [on|off]         Start YayBot again by itself when you log in to the Mac (after a power off)
 #  yb boot                       What autostart runs: restart YayBot + resume the unfinished ticket sessions
 #  yb device [name]              Show / set this computer's name (in session names, replies and log)
+#  yb cloud [git-url|off]        Share the work between several computers through a PRIVATE git repo:
+#                                one works, the others wait and take over (resuming its tickets) when it stops
+#  yb takeover                   This computer takes the work over now (cloud)
 #  yb collect                    Pick up finished ticket sessions now: Slack thread replies + report
 #  yb rescan [days]              Read the channels again (e.g. after changing the plugin or keywords)
 #  yb slack [you]               Your Slack name: the replies in ticket threads are visible only to you
@@ -34,7 +37,8 @@
 #  yb status | log               Status / log
 #  yb install | manifest         Install the `yb` command / print the Slack app manifest (step 1)
 #
-#  Temporary data + config: ~/.yaybot (no database). Compatible with bash 3.2 (macOS).
+#  Temporary data + config: ~/.yaybot (no database); with yb cloud, the queue is also kept in a
+#  private git repo so another computer can continue. Compatible with bash 3.2 (macOS).
 # =============================================================================
 
 YB_HOME="${YAYBOT_HOME:-$HOME/.yaybot}"
@@ -72,6 +76,9 @@ KEEP_SESSIONS_HOURS=24                           # finished ticket sessions are 
 KEEP_AWAKE=1                                     # 1 = keep the Mac awake while YayBot runs (caffeinate)
 WATCH_EVERY=60                                   # seconds between two checks of the main session (auto-restart)
 MAX_RESUMES=2                                    # a ticket session that died (power off, crash) is resumed at most this often
+CLOUD_REPO=""                                    # PRIVATE git repo shared by your computers (yb cloud <git-url>); empty = this computer alone
+CLOUD_BRANCH="yaybot"                            # branch of that repo YayBot writes to
+CLOUD_LEASE=300                                  # seconds without a sign of life before a standby computer takes over
 LOOKBACK_DAYS=7
 CLAUDE_TIMEOUT=900
 API_BASE="${YAYBOT_API_BASE:-https://slack.com/api}"
@@ -221,6 +228,299 @@ lock() {
 	trap 'rm -rf "$YB_HOME/.lock"' EXIT INT TERM
 }
 
+# ---- Cloud: several computers share the work (yb cloud <git-url>) ------------------------
+# The queue (state.json), the results and the conversations of the unfinished ticket sessions
+# live in a PRIVATE git repo. ONE computer works on the tickets and sends a sign of life every
+# minute (lease.json); the others wait on standby. When the working computer stops (switched
+# off, crash, yb stop), a standby computer takes over: it downloads the queue and resumes the
+# unfinished ticket sessions with their conversation (claude --resume).
+# The branch always holds one commit, replaced on every sync. A push only succeeds when nobody
+# pushed in between (git push --force-with-lease), so two computers never both take over.
+CLOUD_DIR="$YB_HOME/cloud"
+CLOUD_SHA=""; CLOUD_OWNER=""; CLOUD_OWNER_ID=""; CLOUD_AT=0; CLOUD_STOPPED=false; CLOUD_HOME=""
+CLOUD_ROLE=leader; CLOUD_TOOK_OVER=0
+cloud_on() { [ -n "$CLOUD_REPO" ]; }
+# Unique per computer (the host name is added, so a copied ~/.yaybot is still told apart)
+machine_id() {
+	[ -s "$YB_HOME/.machine_id" ] || { mkdir -p "$YB_HOME"; new_uuid > "$YB_HOME/.machine_id"; }
+	printf '%s-%s' "$(head -1 "$YB_HOME/.machine_id")" "$(hostname 2>/dev/null | cut -d. -f1)"
+}
+is_cloud_owner() { [ "$(cat "$YB_HOME/.cloud_owner" 2>/dev/null)" = "$(machine_id)" ]; }
+cgit() { git -C "$CLOUD_DIR" -c user.name=YayBot -c user.email=yaybot@localhost "$@"; }
+cgit_net() { # seconds git-args…   (never waits for a password or a host-key question)
+	local s=$1; shift
+	with_timeout "$s" env GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" git -C "$CLOUD_DIR" "$@"
+}
+cloud_lock() {
+	local i=0
+	until mkdir "$YB_HOME/.cloudlock" 2>/dev/null; do
+		i=$((i + 1)); [ $i -gt 300 ] && { logf "cloud: stale lock removed"; rm -rf "$YB_HOME/.cloudlock"; }
+		sleep 1
+	done
+}
+cloud_unlock() { rm -rf "$YB_HOME/.cloudlock"; }
+
+# What is in the cloud? Sets CLOUD_SHA (empty = nothing yet) and the lease: CLOUD_OWNER (device
+# name), CLOUD_OWNER_ID, CLOUD_AT (last sign of life), CLOUD_STOPPED, CLOUD_HOME. → 1 when unreachable
+cloud_fetch() {
+	local out lease
+	CLOUD_SHA=""; CLOUD_OWNER=""; CLOUD_OWNER_ID=""; CLOUD_AT=0; CLOUD_STOPPED=false; CLOUD_HOME=""
+	command -v git >/dev/null 2>&1 || { warn "git is required for the cloud"; return 1; }
+	[ -d "$CLOUD_DIR/.git" ] || { mkdir -p "$CLOUD_DIR" && git init -q "$CLOUD_DIR"; } || return 1
+	cgit remote set-url origin "$CLOUD_REPO" 2>/dev/null || cgit remote add origin "$CLOUD_REPO" || return 1
+	out=$(cgit_net 60 ls-remote origin "refs/heads/$CLOUD_BRANCH" 2>>"$LOG") || return 1
+	CLOUD_SHA=$(printf '%s\n' "$out" | cut -f1 | head -1)
+	[ -n "$CLOUD_SHA" ] || return 0
+	if ! cgit cat-file -e "$CLOUD_SHA^{commit}" 2>/dev/null; then
+		cgit_net 120 fetch -q origin "+refs/heads/$CLOUD_BRANCH:refs/remotes/origin/$CLOUD_BRANCH" 2>>"$LOG" || return 1
+		CLOUD_SHA=$(cgit rev-parse -q --verify "refs/remotes/origin/$CLOUD_BRANCH") || return 1
+	fi
+	lease=$(cgit show "$CLOUD_SHA:lease.json" 2>/dev/null)
+	[ -n "$lease" ] || return 0
+	CLOUD_OWNER=$(jq -r '.device // ""' <<<"$lease"); CLOUD_OWNER_ID=$(jq -r '.id // ""' <<<"$lease")
+	CLOUD_AT=$(jq -r '.at // 0 | floor' <<<"$lease"); CLOUD_STOPPED=$(jq -r '.stopped // false' <<<"$lease")
+	CLOUD_HOME=$(jq -r '.home // ""' <<<"$lease")
+	return 0
+}
+# leader  = this computer works on the tickets
+# standby = another computer works (it sent a sign of life less than CLOUD_LEASE seconds ago)
+# free    = nobody works: cloud empty, stopped with yb stop, or no sign of life for CLOUD_LEASE seconds
+cloud_role() {
+	if [ -n "$CLOUD_OWNER_ID" ] && [ "$CLOUD_STOPPED" != true ]; then
+		[ "$CLOUD_OWNER_ID" = "$(machine_id)" ] && { echo leader; return; }
+		[ $(( $(date +%s) - CLOUD_AT )) -lt "$CLOUD_LEASE" ] && { echo standby; return; }
+	fi
+	echo free
+}
+cloud_age() { # "3 min ago"
+	local s=$(( $(date +%s) - CLOUD_AT ))
+	if [ $s -lt 120 ]; then echo "$s s ago"; else echo "$((s / 60)) min ago"; fi
+}
+
+# This computer → cloud folder: the queue, the results, and the conversations of the tickets
+# still being worked on (gzip, only when they changed)
+cloud_save() {
+	local sid tr gz keep=" "
+	mkdir -p "$CLOUD_DIR/results" "$CLOUD_DIR/transcripts"
+	cp "$STATE" "$CLOUD_DIR/state.json"
+	rm -f "$CLOUD_DIR/results/"*.json; cp "$YB_HOME/results/"*.json "$CLOUD_DIR/results/" 2>/dev/null
+	for sid in $(jq -r '.tickets[] | select(.status == "session") | .sid // empty' "$STATE"); do
+		tr=$(find "$HOME/.claude/projects" -name "$sid.jsonl" 2>/dev/null | head -1); [ -n "$tr" ] || continue
+		gz="$CLOUD_DIR/transcripts/$sid.jsonl.gz"; keep="$keep$sid "
+		[ -f "$gz" ] && [ ! "$tr" -nt "$gz" ] && continue
+		gzip -n -c "$tr" > "$gz.tmp" && mv "$gz.tmp" "$gz"
+	done
+	for gz in "$CLOUD_DIR"/transcripts/*.jsonl.gz; do
+		[ -f "$gz" ] || continue
+		case "$keep" in *" $(basename "$gz" .jsonl.gz) "*) ;; *) rm -f "$gz" ;; esac
+	done
+}
+# Commit the cloud folder + a new lease for this computer and push it — only if the cloud still
+# is CLOUD_SHA (nobody pushed meanwhile)
+cloud_push() { # [stopped: true|false]
+	local tree c
+	jq -n --arg d "$DEVICE" --arg i "$(machine_id)" --arg h "$(cd "$YB_HOME" && pwd -P)" --argjson s "${1:-false}" \
+		'{device:$d, id:$i, at:now, home:$h, stopped:$s}' > "$CLOUD_DIR/lease.json" || return 1
+	cgit add -A . && tree=$(cgit write-tree) && c=$(cgit commit-tree "$tree" -m "YayBot · $DEVICE · $(date '+%Y-%m-%d %H:%M:%S')") || return 1
+	cgit_net 120 push -q --force-with-lease="refs/heads/$CLOUD_BRANCH:$CLOUD_SHA" origin "$c:refs/heads/$CLOUD_BRANCH" 2>>"$LOG" || return 1
+	CLOUD_SHA=$c; cgit update-ref "refs/remotes/origin/$CLOUD_BRANCH" "$c"
+}
+sed_rx()  { printf '%s' "$1" | sed 's/[][\.*^$|]/\\&/g'; }
+sed_rep() { printf '%s' "$1" | sed 's/[\&|]/\\&/g'; }
+# Cloud folder → this computer: queue, results, conversations (put where claude --resume looks for
+# them: ~/.claude/projects/<this computer's ~/.yaybot>/<id>.jsonl)
+cloud_restore() {
+	local f sid tmp new proj
+	[ -s "$CLOUD_DIR/state.json" ] && jq -e 'type == "object"' "$CLOUD_DIR/state.json" >/dev/null 2>&1 || return 0
+	tmp=$(mktemp "$YB_HOME/.st.XXXXXX") && cp "$CLOUD_DIR/state.json" "$tmp" && mv "$tmp" "$STATE"
+	mkdir -p "$YB_HOME/results"; rm -f "$YB_HOME/results/"*.json
+	cp "$CLOUD_DIR/results/"*.json "$YB_HOME/results/" 2>/dev/null
+	new=$(cd "$YB_HOME" && pwd -P)
+	proj="$HOME/.claude/projects/$(printf '%s' "$new" | sed 's/[^a-zA-Z0-9]/-/g')"
+	for f in "$CLOUD_DIR"/transcripts/*.jsonl.gz; do
+		[ -f "$f" ] || continue
+		sid=$(basename "$f" .jsonl.gz); mkdir -p "$proj"
+		find "$HOME/.claude/projects" -name "$sid.jsonl" ! -path "$proj/*" -delete 2>/dev/null   # old copies
+		if [ -n "$CLOUD_HOME" ] && [ "$CLOUD_HOME" != "$new" ]; then
+			gunzip -c "$f" | LC_ALL=C sed "s|$(sed_rx "$CLOUD_HOME")|$(sed_rep "$new")|g" > "$proj/$sid.jsonl"
+		else
+			gunzip -c "$f" > "$proj/$sid.jsonl"
+		fi
+	done
+}
+# Take the work over (after cloud_fetch). From another computer: download its queue and its
+# conversations. From this computer's own old lease, or an empty cloud: upload the local queue.
+cloud_takeover() {
+	local from=$CLOUD_OWNER
+	if [ -n "$CLOUD_SHA" ] && [ -n "$CLOUD_OWNER_ID" ] && [ "$CLOUD_OWNER_ID" != "$(machine_id)" ]; then
+		cgit reset -q --hard "$CLOUD_SHA" && cgit clean -qfd || return 1
+		cloud_push || return 1
+		cloud_restore
+		CLOUD_TOOK_OVER=1
+		logf "cloud: took over from $from — $(jq '[.tickets[] | select(.status == "session")] | length' "$STATE") ticket(s) to resume"
+	else
+		cloud_save; cloud_push || return 1
+		logf "cloud: this computer works on the tickets"
+	fi
+	machine_id > "$YB_HOME/.cloud_owner"
+}
+
+# yb start: work, or wait on standby? Sets CLOUD_ROLE (leader | standby); may take over.
+cloud_start_role() {
+	CLOUD_ROLE=leader; CLOUD_TOOK_OVER=0
+	cloud_on || return 0
+	cloud_lock
+	if ! cloud_fetch; then
+		if is_cloud_owner; then warn "Cloud not reachable ($CLOUD_REPO) — working on; it syncs again when it can"
+		else CLOUD_ROLE=standby; warn "Cloud not reachable ($CLOUD_REPO) — on standby until it is (see: yb log)"; fi
+	else
+		case "$(cloud_role)" in
+			leader)  { cloud_save && cloud_push && machine_id > "$YB_HOME/.cloud_owner"; } || CLOUD_ROLE=standby ;;
+			standby) CLOUD_ROLE=standby ;;
+			free)    cloud_takeover || CLOUD_ROLE=standby ;;
+		esac
+	fi
+	cloud_unlock
+	[ "$CLOUD_ROLE" = standby ] && ! is_cloud_owner && rm -f "$YB_HOME/.cloud_owner"
+	return 0
+}
+# Before working on tickets (yb run / try / collect): may this computer do it? (no cloud → yes)
+cloud_guard() {
+	cloud_on || return 0
+	local r
+	cloud_lock
+	if ! cloud_fetch; then
+		cloud_unlock
+		is_cloud_owner && { warn "Cloud not reachable — working on; it syncs again when it can"; return 0; }
+		say "Cloud not reachable ($CLOUD_REPO) and this computer is on standby — nothing done."; return 1
+	fi
+	case "$(cloud_role)" in
+		leader) cloud_unlock; return 0 ;;
+		free) if [ -z "$CLOUD_OWNER_ID" ] || [ "$CLOUD_OWNER_ID" = "$(machine_id)" ]; then
+		          cloud_takeover; r=$?; cloud_unlock; return $r
+		      fi
+		      cloud_unlock
+		      say "Standby: $CLOUD_OWNER stopped working ($( [ "$CLOUD_STOPPED" = true ] && echo "yb stop" || echo "last sign of life $(cloud_age)")). Take over now: yb takeover"
+		      return 1 ;;
+	esac
+	cloud_unlock
+	say "Standby: $CLOUD_OWNER works on the tickets (last sign of life $(cloud_age)). Take over now: yb takeover"
+	return 1
+}
+# The working computer: queue + sign of life → cloud.  → 0 ok · 1 cloud not reachable · 2 another computer took over
+cloud_sync() {
+	cloud_on || return 0
+	local rc=0
+	cloud_lock
+	if ! cloud_fetch; then rc=1
+	else
+		case "$(cloud_role)" in
+			leader) cloud_save
+			        if ! cloud_push; then
+			            if cloud_fetch && [ "$(cloud_role)" != leader ]; then rc=2; else rc=1; fi
+			        fi ;;
+			*) if [ -z "$CLOUD_OWNER_ID" ]; then cloud_save; { cloud_push && machine_id > "$YB_HOME/.cloud_owner"; } || rc=1
+			   else rc=2; fi ;;
+		esac
+	fi
+	cloud_unlock
+	[ $rc = 1 ] && logf "cloud: could not sync with $CLOUD_REPO (will retry)"
+	[ $rc = 2 ] && rm -f "$YB_HOME/.cloud_owner"
+	return $rc
+}
+# Another computer took over: stop working here (it continues the tickets)
+cloud_demote() {
+	local id
+	rm -f "$YB_HOME/.cloud_owner"
+	tmux kill-session -t =yaybot 2>/dev/null
+	for id in $(active_ids); do tmux kill-session -t "=yb-$id" 2>/dev/null; done
+	logf "cloud: $CLOUD_OWNER took over — this computer is on standby"
+}
+# This computer stops working (yb stop): hand the tickets over to a standby computer right away
+cloud_release() {
+	cloud_on && is_cloud_owner || return 0
+	cloud_lock
+	if cloud_fetch && [ "$(cloud_role)" = leader ]; then
+		cloud_save
+		cloud_push true && { ok "Handed the tickets over: a standby computer takes over within a minute"; logf "cloud: released"; }
+	fi
+	cloud_unlock
+	rm -f "$YB_HOME/.cloud_owner"
+}
+# Watchdog, every minute. → 0 when this computer works (then the main session is checked)
+cloud_watch() {
+	local role
+	if is_cloud_owner; then
+		cloud_sync
+		case $? in
+			2) say "$(date '+%H:%M') $CLOUD_OWNER took over — this computer is on standby"; cloud_demote; return 1 ;;
+			*) return 0 ;;
+		esac
+	fi
+	cloud_lock; if cloud_fetch; then role=$(cloud_role); else role=unknown; fi; cloud_unlock
+	case "$role" in
+		standby) tmux has-session -t =yaybot 2>/dev/null && cloud_demote ;;
+		leader|free)
+			say "$(date '+%H:%M') ${CLOUD_OWNER:-nobody} is not working — this computer takes over"
+			logf "cloud: ${CLOUD_OWNER:-nobody} is not working (last sign of life $(cloud_age)) — taking over"
+			( YAYBOT_START_WAIT=10 cmd_start ) >>"$LOG" 2>&1 ;;
+	esac
+	return 1
+}
+# One line for yb status / yb cloud
+cloud_status() {
+	cloud_on || { say "Cloud:        off — this computer works alone (several computers: yb cloud <git-url>)"; return 0; }
+	cloud_lock; cloud_fetch; local ok=$?; cloud_unlock
+	if [ $ok != 0 ]; then say "Cloud:        ✗ $CLOUD_REPO not reachable (see: yb log)"; return 0; fi
+	case "$(cloud_role)" in
+		leader)  say "Cloud:        ✓ this computer works on the tickets (sign of life $(cloud_age)) · $CLOUD_REPO" ;;
+		standby) say "Cloud:        ⏸ standby — $CLOUD_OWNER works on the tickets (sign of life $(cloud_age)) · $CLOUD_REPO" ;;
+		*) if [ -z "$CLOUD_OWNER_ID" ]; then say "Cloud:        nobody yet — the first computer to run yb start works · $CLOUD_REPO"
+		   else say "Cloud:        nobody works — $CLOUD_OWNER stopped ($( [ "$CLOUD_STOPPED" = true ] && echo "yb stop" || echo "last sign of life $(cloud_age)")); a standby computer takes over · $CLOUD_REPO"; fi ;;
+	esac
+}
+
+cmd_cloud() { # [git-url | off]
+	need; st_init
+	case "${1:-}" in
+	"")
+		cloud_status
+		cloud_on && say "  This computer: $DEVICE · take over now: yb takeover · turn off: yb cloud off" ;;
+	off)
+		cloud_release; conf_set CLOUD_REPO ""
+		ok "Cloud off: this computer works alone again (the data in the repo is kept)" ;;
+	*)
+		command -v git >/dev/null 2>&1 || die "git is required: brew install git"
+		CLOUD_REPO=$1
+		cloud_lock; cloud_fetch; local r=$?; cloud_unlock
+		[ $r = 0 ] || die "Cannot reach $1 — check the URL and that this computer can push to it (git ls-remote $1)"
+		conf_set CLOUD_REPO "$1"
+		ok "Cloud on: $1 (branch $CLOUD_BRANCH)"
+		say "  Keep this repo PRIVATE: it holds the tickets' text and Claude's conversations."
+		cloud_status
+		if [ -f "$YB_HOME/.running" ]; then cmd_start
+		else say "  Next: ${c_b}yb start${c_0} on every computer — one works, the others wait on standby and take over when it stops"; fi ;;
+	esac
+}
+
+# yb takeover: this computer takes the work over now (e.g. you know the other one is off)
+cmd_takeover() {
+	need; need_token; st_init
+	cloud_on || die "The cloud is off — turn it on first: yb cloud <git-url>"
+	local from
+	cloud_lock
+	cloud_fetch || { cloud_unlock; die "Cloud not reachable: $CLOUD_REPO"; }
+	if [ "$(cloud_role)" = leader ]; then cloud_unlock; ok "This computer already works on the tickets"; cmd_start; return; fi
+	from=$CLOUD_OWNER
+	cloud_takeover || { cloud_unlock; die "Could not take over (the cloud changed at the same moment) — try again"; }
+	cloud_unlock
+	ok "Took over${from:+ from $from}: $(jq '[.tickets[] | select(.status == "session")] | length' "$STATE") ticket(s) to resume"
+	[ -n "$from" ] && [ "$from" != "$DEVICE" ] && say "  $from stops working at its next sign of life (within ${WATCH_EVERY}s, if it is still on)"
+	CLOUD_TOOK_OVER=0
+	cmd_start
+	"$SELF" run
+}
+
 # ---- Plugins: which plugin is a ticket about? --------------------------------------
 flat() { printf '%s' "$1" | tr '\n\r\t' '   '; }
 
@@ -311,6 +611,7 @@ AUTO_FIX_TAGS="$AUTO_FIX_TAGS"
 MIN_CONFIDENCE="$MIN_CONFIDENCE"
 RC_NAME="$RC_NAME"
 DEVICE="$DEVICE"
+CLOUD_REPO="$CLOUD_REPO"
 RC_EVERY="$RC_EVERY"
 TICKET_SESSIONS=$TICKET_SESSIONS
 MAX_SESSIONS=$MAX_SESSIONS
@@ -642,7 +943,7 @@ open_ticket_session() { # key [resume]
 	sysp=$(session_system "$id" "$tag" "$text" "$allow" "$ts" "$ch" "$user" "$resfile" "$plug")
 	if [ "$how" = resume ]; then
 		sid=$(jq -r '.sid // empty' <<<"$t")
-		prompt="YayBot: this session was interrupted (the computer $DEVICE was switched off or Claude stopped). Continue ticket $id from where you were and finish it exactly as instructed: write the result JSON, run the collect command, show the short result and send the push notification."
+		prompt="YayBot: this session was interrupted (a computer was switched off or Claude stopped); it now runs on $DEVICE. Continue ticket $id from where you were and finish it exactly as instructed: write the result JSON, run the collect command, show the short result and send the push notification.$( [ "$allow" = 1 ] && printf ' If you were fixing code and %s does not exist on this computer, create the worktree again as instructed (if the branch yaybot/%s was already pushed, fetch it and use it).' "$wt" "$id")"
 		start=(--resume "$sid")
 	else
 		sid=$(new_uuid); rm -f "$resfile"
@@ -907,9 +1208,11 @@ notify_rc() {
 cmd_run() {
 	c_g=; c_r=; c_y=; c_b=; c_0=
 	need; need_token; st_init; lock
+	cloud_guard || return 0
 	local before after
 	before=$(latest_report)
 	cmd_listen; cmd_work; cmd_report
+	cloud_sync
 	after=$(latest_report)
 	if [ "$YAYBOT_IN_RC" = 1 ]; then
 		# running inside the Remote Control session: the report just printed is delivered,
@@ -1211,7 +1514,10 @@ cmd_boot() {
 	n=$(jq '[.tickets[] | select(.status == "session")] | length' "$STATE")
 	say "Tickets that were being worked on: $n (they are resumed)"
 	cmd_start
-	cmd_run
+	if [ "$CLOUD_ROLE" = standby ]; then
+		logf "boot: standby — $CLOUD_OWNER works on the tickets"; say "Standby: $CLOUD_OWNER works on the tickets."; return 0
+	fi
+	[ "$CLOUD_TOOK_OVER" = 1 ] || cmd_run
 	logf "boot: YayBot is back — $n ticket(s) were in progress"
 	say "YayBot is back."
 }
@@ -1280,6 +1586,7 @@ EOF
 # ---- yb try: take the newest ticket now and open its session (to see it working) ----
 cmd_try() {
 	need; need_token; st_init; need_plugins; lock
+	cloud_guard || return 0
 	local since ch msg ts user text pm best="" bts=0 key cls
 	since=$(to_epoch "${1:-$LOOKBACK_DAYS}")
 	say "Looking for the newest $PLUGIN ticket since $(fmt_date "$since" '+%Y-%m-%d')…"
@@ -1301,6 +1608,7 @@ cmd_try() {
 	st_update --arg k "$key" --arg c "$ch" --arg t "$ts" --arg u "$user" --arg x "$text" --arg tag "${cls%%|*}" --arg r "${cls#*|}" --arg w "${pm#*|}" --arg p "${pm%%|*}" \
 		'del(.seen[$k]) | .tickets[$k] = {channel:$c, ts:$t, user:$u, text:$x, plugin:$p, tag:$tag, tag_reason:$r, why:$w, status:"new", at:now}'
 	cmd_work
+	cloud_sync
 	say ""; say "Open the ${c_b}Claude${c_0} app on your phone → Code → the session above. On this Mac: ${c_b}yb sessions${c_0} · problems: ${c_b}yb doctor${c_0}"
 }
 
@@ -1332,6 +1640,7 @@ cmd_doctor() {
 	[ "$(jq -r '(.agentPushNotifEnabled == true) and (.inputNeededNotifEnabled == true)' "$HOME/.claude/settings.json" 2>/dev/null)" = true ] \
 		&& ok "Push notifications on" || warn "Push notifications off: yb ping"
 
+	say ""; say "${c_b}Cloud${c_0}"; cloud_status | sed 's/^Cloud: */  /'
 	say ""; say "${c_b}Tickets${c_0}"
 	jq -r '"  in queue: \(.tickets | length) (" + ([.tickets[] | .status] | group_by(.) | map("\(.[0]) \(length)") | join(", ")) + ") · already reported (skipped for 7 days): \(.seen | length)"' "$STATE"
 	say "  Look for tickets without processing: yb scan 30 · process the newest one now: yb try"
@@ -1461,10 +1770,21 @@ cmd_start() {
 	command -v "$CLAUDE_BIN" >/dev/null 2>&1 || die "Claude Code (the claude command) is required"
 	enable_push
 	touch "$YB_HOME/.running"
+	cloud_start_role
+	if [ "$CLOUD_ROLE" = standby ]; then
+		tmux has-session -t =yaybot 2>/dev/null && cloud_demote
+		start_watch
+		ok "Standby: ${CLOUD_OWNER:-another computer} works on the tickets. This computer ($DEVICE) takes over by itself"
+		say "  when it stops (switched off, crash, yb stop) for $((CLOUD_LEASE / 60)) min, and resumes its unfinished tickets."
+		say "  Take over now: ${c_b}yb takeover${c_0} · state: ${c_b}yb cloud${c_0}"
+		return 0
+	fi
+	[ "$CLOUD_TOOK_OVER" = 1 ] && say "Took over from ${CLOUD_OWNER:-the other computer}: its unfinished tickets are resumed here."
 	if tmux has-session -t yaybot 2>/dev/null; then
 		if claude_alive yaybot || [ "$(sess_state yaybot)" = trust ]; then
 			start_watch
 			ok "The YayBot session is already running. Phone: Claude app → session \"$RC_LABEL\". On this Mac: yb attach"
+			[ "$CLOUD_TOOK_OVER" = 1 ] && "$SELF" run
 			return
 		fi
 		warn "The YayBot session had stopped ($(sess_state yaybot | cut -c9- | cut -c1-80)) — restarting it"
@@ -1484,9 +1804,18 @@ cmd_start() {
 	say "  • Phone: open the Claude app → session \"$RC_LABEL\" for the summary reports; every ticket also gets its own"
 	say "    session (\"T7 · major · #channel · person\") that pushes its result to your phone."
 	say "  • Test now with one ticket: ${c_b}yb try${c_0} · something wrong: ${c_b}yb doctor${c_0}"
+	[ "$CLOUD_TOOK_OVER" = 1 ] && "$SELF" run
+	return 0
 }
 cmd_stop() {
+	local id
 	rm -f "$YB_HOME/.running"
+	# with the cloud: hand over to a standby computer now; it resumes the unfinished tickets,
+	# so they are stopped here (on this computer alone they are resumed at the next yb start)
+	if cloud_on && is_cloud_owner; then
+		for id in $(active_ids); do tmux kill-session -t "=yb-$id" 2>/dev/null; done
+		cloud_release
+	fi
 	tmux kill-session -t =yb-watch 2>/dev/null && ok "Stopped the watchdog (the Mac may sleep again)"
 	if tmux has-session -t yaybot 2>/dev/null; then tmux kill-session -t yaybot && ok "Stopped the YayBot session"; else say "No YayBot session is running"; fi
 }
@@ -1505,13 +1834,17 @@ cmd_watch() {
 		caffeinate -i -w $$ & say "Keeping the Mac awake (caffeinate) while YayBot runs."
 	fi
 	say "YayBot watchdog: checks the main session every ${WATCH_EVERY}s. Stop with: yb stop"
+	cloud_on && say "Cloud: $CLOUD_REPO — sends a sign of life every ${WATCH_EVERY}s, or takes over when the working computer stops."
 	while sleep "$WATCH_EVERY" && [ -f "$YB_HOME/.running" ]; do
+		if cloud_on; then cloud_watch || continue; fi
 		if ! tmux has-session -t =yaybot 2>/dev/null || { ! claude_alive yaybot && [ "$(sess_state yaybot)" != trust ]; }; then
 			now=$(date +%s); t=""
 			for t0 in $restarts; do [ $((now - t0)) -lt 3600 ] && t="$t $t0"; done; restarts=$t
 			if [ "$(printf '%s\n' $restarts | grep -c .)" -ge 3 ]; then
 				logf "watchdog: main session stopped again — not restarting (3 restarts in the last hour). See: yb doctor"
 				say "$(date '+%H:%M') main session keeps stopping — not restarting. See: yb doctor"
+				# with the cloud, let a standby computer do the work meanwhile
+				if cloud_on && is_cloud_owner; then cloud_release; cloud_demote; fi
 			else
 				logf "watchdog: main session stopped ($(sess_state yaybot 2>/dev/null | cut -c9- | cut -c1-80)) — restarting"
 				say "$(date '+%H:%M') main session stopped — restarting"
@@ -1540,6 +1873,7 @@ cmd_status() {
 	case "$(uname -s)" in Darwin)
 		if [ -f "$HOME/Library/LaunchAgents/$AGENT_ID.plist" ]; then say "Autostart:    ✓ on (after login)"; else say "Autostart:    ✗ off (yb autostart on)"; fi ;; esac
 	[ -f "$YB_HOME/boot.log" ] && say "Last boot:    $(grep -h 'YayBot boot on' "$YB_HOME/boot.log" | tail -1 | cut -c1-19)"
+	cloud_status
 	say "Config:       $CONF"
 	say "Ticket sessions:"; cmd_sessions
 	jq -r '"Tickets in queue: \(.tickets | length)",
@@ -1586,15 +1920,17 @@ case "${1:-help}" in
 	try)      shift; cmd_try "$@" ;;
 	boot)     cmd_boot ;;
 	autostart) shift; cmd_autostart "$@" ;;
+	cloud)    shift; cmd_cloud "$@" ;;
+	takeover) cmd_takeover ;;
 	device)   shift
 	          if [ -z "$1" ]; then say "This computer is: $DEVICE  (sessions: \"$RC_LABEL\", \"T7 · … · $DEVICE\")"; say "Change it: yb device <name>   e.g. yb device work"
 	          else st_init; n=$(printf '%s' "$1" | tr 'A-Z' 'a-z' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-24)
 	               [ -n "$n" ] || die "Invalid name"; conf_set DEVICE "$n"; ok "This computer is now: $n"
 	               say "Restart to rename the sessions: yb stop all && yb start"; fi ;;
-	rescan)   shift; need; need_token; st_init
+	rescan)   shift; need; need_token; st_init; cloud_guard || exit 0
 	          case "${1:-}" in ''|*[!0-9]*) ;; *) LOOKBACK_DAYS=$1 ;; esac
 	          st_update '.cursor = {}'; ok "Reading the channels again from $(fmt_date "$(to_epoch "")" '+%Y-%m-%d') (tickets already reported are skipped)"; cmd_run ;;
-	collect)  need; need_token; st_init; lock; collect_sessions; cmd_report ;;
+	collect)  need; need_token; st_init; lock; cloud_guard || exit 0; collect_sessions; cmd_report; cloud_sync ;;
 	slack)    shift; cmd_slack "$@" ;;
 	doctor)   cmd_doctor ;;
 	close)    shift; cmd_close "$@" ;;
