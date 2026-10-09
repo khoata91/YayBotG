@@ -207,7 +207,7 @@ To make a second computer continue the work when the main one is switched off in
 2. On **each** computer, set up YayBot as usual (`yb setup xoxb-…`, same token, plugin and channels), with a different `yb device` name, then:
 
    ```bash
-   yb cloud git@github.com:<you>/yaybot-state.git   # the computer must be able to push to it (git/gh login)
+   yb cloud https://github.com/khoata91/yaybot-state.git   # the computer must be able to push to it (git/gh login)
    yb start
    yb autostart on                                   # macOS: come back after a restart
    ```
